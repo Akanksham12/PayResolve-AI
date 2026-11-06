@@ -1,17 +1,29 @@
 import pytest
 
 from payresolve.db import connection, resolve_reconciliation_review
+from payresolve.llm import LLMResult
 from payresolve.repository import (
-    fetch_pending_reconciliations, fetch_reconciliation_history, fetch_reconciliation_logs,
+    fetch_order_ids_for_transaction, fetch_pending_reconciliations,
+    fetch_reconciliation_history, fetch_reconciliation_logs,
 )
-from payresolve.service import reconcile_order
+from payresolve.service import investigate, reconcile_order
 from scripts.seed_db import seed_database, seed_reconciliation_data
 
 
 @pytest.fixture
-def reconciliation_db(tmp_path):
+def reconciliation_db(tmp_path, monkeypatch):
     database = tmp_path / "reconciliation.sqlite"
     seed_database(database, transaction_count=500)
+    from payresolve.agents import investigation, resolution
+
+    monkeypatch.setattr(
+        investigation, "generate",
+        lambda prompt: LLMResult(text=None, used=False, error="test fallback"),
+    )
+    monkeypatch.setattr(
+        resolution, "generate",
+        lambda prompt: LLMResult(text=None, used=False, error="test fallback"),
+    )
     return database
 
 
@@ -66,7 +78,10 @@ def test_transaction_only_database_can_be_backfilled_without_reseeding(reconcili
     assert seed_reconciliation_data(reconciliation_db) == 0
     with connection(reconciliation_db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 500
-        assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 506
+        assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 500
+    assert fetch_order_ids_for_transaction(
+        "SHOP-TXN-PAID-UNPAID", reconciliation_db
+    ) == ["SHOP-ORD-PAID-UNPAID"]
 
 
 def test_successful_gateway_payment_with_unpaid_order_is_flagged(reconciliation_db):
@@ -134,3 +149,66 @@ def test_reconciliation_history_logs_and_human_decision_are_persisted(reconcilia
         "approved", "Support Executive", "Order corrected after source-system verification."
     )
     assert fetch_pending_reconciliations(reconciliation_db) == []
+
+
+def test_single_transaction_investigation_checks_all_linked_records(reconciliation_db):
+    report = investigate(
+        "SHOP-TXN-PAID-UNPAID",
+        "Customer asks about the payment and order.",
+        persist=True,
+        db_path=str(reconciliation_db),
+    )
+
+    assert report.transaction.found
+    assert len(report.reconciliations) == 1
+    reconciliation = report.reconciliations[0]
+    assert reconciliation.order_id == "SHOP-ORD-PAID-UNPAID"
+    assert reconciliation.reconciliation.status == "review_required"
+    assert any("ShopKart order status is created" in item
+               for item in reconciliation.reconciliation.discrepancies)
+    assert report.resolution.requires_human_review
+    assert report.resolution.recommendation == "Review linked merchant payment records"
+    assert "Reconciliation Agent" in [event.agent for event in report.events]
+    assert "Supervisor Agent" in [event.agent for event in report.events]
+    assert report.dispute_id is not None
+    assert reconciliation.run_id is not None
+    with connection(reconciliation_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM disputes").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM reconciliation_runs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM investigation_logs").fetchone()[0] == len(report.events)
+
+
+def test_single_transaction_investigation_reports_all_clear_when_linked_records_match(reconciliation_db):
+    report = investigate(
+        "SHOP-TXN-MATCHED",
+        "Please check this payment.",
+        persist=False,
+        db_path=str(reconciliation_db),
+    )
+
+    assert report.transaction.found
+    assert len(report.reconciliations) == 1
+    assert report.reconciliations[0].reconciliation.status == "matched"
+    assert not report.resolution.requires_human_review
+
+
+def test_transaction_without_linked_order_is_explicitly_unverified(reconciliation_db):
+    with connection(reconciliation_db) as conn:
+        conn.execute(
+            "DELETE FROM gateway_settlement_lines WHERE gateway_payment_id IN "
+            "(SELECT gateway_payment_id FROM gateway_payments WHERE transaction_id='DEMO-SUCCESS-001')"
+        )
+        conn.execute("DELETE FROM gateway_payments WHERE transaction_id='DEMO-SUCCESS-001'")
+        conn.execute("DELETE FROM orders WHERE order_id='ORD-DEMO-SUCCESS-001'")
+
+    report = investigate(
+        "DEMO-SUCCESS-001",
+        "Please check this payment.",
+        persist=False,
+        db_path=str(reconciliation_db),
+    )
+
+    assert report.transaction.found
+    assert report.reconciliations == []
+    assert report.resolution.requires_human_review
+    assert "No ShopKart order is linked" in report.resolution.review_reason
