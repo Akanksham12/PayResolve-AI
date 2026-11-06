@@ -23,6 +23,7 @@ def run_resolution_agent(complaint: str, transaction: TransactionOutput, fraud: 
     must_review = (
         not transaction.found or fraud.risk_level == "high"
         or investigation.confidence < 0.6 or bool(transaction.data_conflicts)
+        or bool(investigation.customer_reported_conflicts)
         or investigation.category == "duplicate_payment"
     )
     review_reasons = []
@@ -34,12 +35,26 @@ def run_resolution_agent(complaint: str, transaction: TransactionOutput, fraud: 
         review_reasons.append("investigation confidence is low")
     if transaction.data_conflicts:
         review_reasons.append("transaction records contain contradictions")
+    if investigation.customer_reported_conflicts:
+        review_reasons.append("customer report does not match or cannot be verified against available records")
     if investigation.category == "duplicate_payment":
         review_reasons.append("customer reports a duplicate charge that needs transaction-reference verification")
 
     if not transaction.found:
         recommendation = "Request transaction verification"
         next_steps = ["Ask the customer to confirm the transaction ID and share a redacted payment reference."]
+    elif investigation.customer_reported_conflicts and investigation.category != "duplicate_payment":
+        if any("no settlement record is available" in item
+               for item in investigation.customer_reported_conflicts):
+            recommendation = "Reconcile missing settlement record"
+            next_steps = ["Ask the settlement operations team to verify the settlement record and any reported bank credit."]
+        else:
+            recommendation = "Review customer report against payment records"
+            next_steps = [
+                "Explain what the available transaction records show without treating them as proof of the customer's bank activity.",
+                "Ask for a redacted screenshot or reference for the reported status, debit, refund, or settlement.",
+                "Have support verify the relevant gateway, order, refund, settlement, or bank records before advising on an action.",
+            ]
     elif investigation.category == "duplicate_payment":
         successful_related = [
             item for item in transaction.related_transactions
@@ -114,6 +129,15 @@ def run_resolution_agent(complaint: str, transaction: TransactionOutput, fraud: 
             f"{tx['status']} for {tx['currency']} {tx['amount']:.2f}, but we could not verify a second "
             "matching successful payment in the ledger. Please share the other transaction reference or "
             "a redacted bank record so a support specialist can review it. We have not confirmed a duplicate charge."
+        )
+    elif investigation.customer_reported_conflicts:
+        tx = transaction.transaction
+        customer_response = (
+            f"Thanks for contacting us. You reported a concern that does not fully match what our available "
+            f"records show: transaction {tx['transaction_id']} is recorded as {tx['status']}. "
+            "These records do not verify activity in your bank account. Please share a redacted screenshot "
+            "or reference so a support specialist can compare the relevant records. No payment or refund "
+            "action has been initiated."
         )
     else:
         tx = transaction.transaction

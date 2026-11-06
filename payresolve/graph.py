@@ -198,7 +198,9 @@ def investigation_node(state: InvestigationState) -> dict:
         fraud = state["fraud"] or FraudOutput(
             risk_level="unknown", risk_score=0, classification_note="Risk assessment unavailable."
         )
-        result, llm_used = run_investigation_agent(state["complaint"], transaction, fraud)
+        result, llm_used = run_investigation_agent(
+            state["complaint"], transaction, fraud, state.get("reconciliations", [])
+        )
         return {
             "investigation": result,
             "events": _append_event(
@@ -251,7 +253,11 @@ def resolution_node(state: InvestigationState) -> dict:
             result = result.model_copy(update={
                 "recommendation": (
                     result.recommendation
-                    if result.recommendation == "Reconcile missing settlement record"
+                    if result.recommendation in {
+                        "Reconcile missing settlement record",
+                        "Review customer report against payment records",
+                        "Verify the unconfirmed duplicate-charge report",
+                    }
                     else "Review linked merchant payment records"
                 ),
                 "next_steps": [

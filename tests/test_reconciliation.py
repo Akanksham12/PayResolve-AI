@@ -178,6 +178,20 @@ def test_single_transaction_investigation_checks_all_linked_records(reconciliati
         assert conn.execute("SELECT COUNT(*) FROM investigation_logs").fetchone()[0] == len(report.events)
 
 
+def test_customer_reported_order_status_is_compared_to_linked_order(reconciliation_db):
+    report = investigate(
+        "SHOP-TXN-PAID-UNPAID",
+        "The payment went through, but my order failed.",
+        persist=False,
+        db_path=str(reconciliation_db),
+    )
+
+    assert any("reports the ShopKart order as failed" in item
+               for item in report.investigation.customer_reported_conflicts)
+    assert report.resolution.requires_human_review
+    assert report.resolution.recommendation == "Review customer report against payment records"
+
+
 def test_single_transaction_investigation_reports_all_clear_when_linked_records_match(reconciliation_db):
     report = investigate(
         "SHOP-TXN-MATCHED",

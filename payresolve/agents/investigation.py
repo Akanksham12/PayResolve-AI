@@ -2,7 +2,9 @@ import re
 from difflib import SequenceMatcher
 
 from payresolve.llm import generate
-from payresolve.schemas import FraudOutput, InvestigationOutput, TransactionOutput
+from payresolve.schemas import (
+    FraudOutput, InvestigationOutput, ReconciliationReport, TransactionOutput,
+)
 
 
 def _mentions_duplicate_charge(complaint: str) -> bool:
@@ -32,18 +34,128 @@ def categorize_complaint(complaint: str) -> str:
         return "refund"
     if any(word in text for word in ("pending", "processing", "stuck")):
         return "pending_payment"
-    if any(word in text for word in ("failed", "declined", "unsuccessful")):
+    if any(word in text for word in ("failed", "declined", "unsuccessful", "not successful", "did not go through")):
         return "failed_payment"
     if any(word in text for word in ("debited", "charged", "deducted", "money gone")):
         return "debit_or_charge"
     return "other"
 
 
+def _reported_payment_status(complaint: str, category: str) -> str | None:
+    text = complaint.casefold()
+    if category in {"refund", "duplicate_payment"} or re.search(r"\bsettlement|payout\b", text):
+        return None
+    if category == "pending_payment":
+        return "pending"
+    if category == "failed_payment":
+        return "failed"
+    if re.search(r"\b(?:payment|transaction|charge)\b.{0,30}\b(?:successful|succeeded|completed|paid|went through|went thru)\b", text):
+        return "successful"
+    return None
+
+
+def _reported_record_conflicts(
+    complaint: str, category: str, transaction: TransactionOutput,
+    reconciliations: list[ReconciliationReport],
+) -> list[str]:
+    if not transaction.found:
+        return []
+
+    text = complaint.casefold()
+    tx = transaction.transaction
+    conflicts = []
+    reported_status = _reported_payment_status(complaint, category)
+    if reported_status and reported_status != tx["status"]:
+        conflicts.append(
+            f"Customer reports the payment as {reported_status}, but transaction records show {tx['status']}."
+        )
+
+    reports_debit = bool(re.search(r"\b(?:debited|deducted|charged|taken from my account)\b", text))
+    if reports_debit and tx["status"] in {"failed", "pending"}:
+        conflicts.append(
+            f"Customer reports money was debited, but the transaction is recorded as {tx['status']}; "
+            "PayResolve has no bank-side debit confirmation."
+        )
+
+    if category == "refund":
+        refund_statuses = {refund["status"] for refund in transaction.refunds}
+        reports_not_received = bool(re.search(r"\b(?:not received|haven't received|have not received|missing)\b", text))
+        reports_pending = bool(re.search(r"\b(?:pending|processing|not processed)\b", text))
+        reports_completed = bool(re.search(r"\b(?:completed|processed|received|issued)\b", text))
+        if reports_not_received and "completed" in refund_statuses:
+            conflicts.append(
+                "Customer reports not receiving the refund, while a refund record is marked completed; "
+                "the customer's bank receipt is not verified."
+            )
+        elif reports_pending and "completed" in refund_statuses:
+            conflicts.append("Customer reports the refund is pending, but the refund record is marked completed.")
+        elif reports_completed and "completed" not in refund_statuses:
+            conflicts.append(
+                "Customer reports the refund as completed, but no completed refund record was found."
+            )
+        elif not transaction.refunds:
+            conflicts.append("Customer asks about a refund, but no refund record was found for this transaction.")
+
+    reports_unsettled = bool(
+        re.search(
+            r"\b(?:not settled|unsettled|settlement(?: is)? pending|payout(?: is)? pending)\b",
+            text,
+        )
+    )
+    if reports_unsettled and transaction.settlements and all(
+        item["status"] == "settled" for item in transaction.settlements
+    ):
+        conflicts.append(
+            "Customer reports settlement is still pending, but settlement records are marked settled; "
+            "bank receipt should be verified separately."
+        )
+    elif reports_unsettled and not transaction.settlements:
+        conflicts.append(
+            "Customer reports settlement is pending and no settlement record is available to verify it."
+        )
+
+    order_status_claims = []
+    if re.search(r"\b(?:order|my order)\b.{0,30}\b(?:failed|unsuccessful)\b", text):
+        order_status_claims.append("failed")
+    if re.search(r"\b(?:order|my order)\b.{0,30}\b(?:cancelled|canceled)\b", text):
+        order_status_claims.append("cancelled")
+    reports_order_not_paid = bool(re.search(r"\b(?:unpaid|not paid)\b", text))
+    if reports_order_not_paid:
+        order_status_claims.append("not_paid")
+    if not reports_order_not_paid and re.search(
+        r"\b(?:order|my order)\b.{0,30}\b(?:paid|successful|succeeded)\b", text
+    ):
+        order_status_claims.append("paid")
+    for report in reconciliations:
+        order = report.reconciliation.order
+        if not order:
+            continue
+        actual_status = order["status"]
+        for claimed_status in order_status_claims:
+            conflicts_with_record = (
+                claimed_status == "not_paid" and actual_status == "paid"
+                or claimed_status in {"failed", "cancelled"} and actual_status != claimed_status
+                or claimed_status == "paid" and actual_status != "paid"
+            )
+            if conflicts_with_record:
+                conflicts.append(
+                    f"Customer reports the ShopKart order as {claimed_status.replace('_', ' ')}, "
+                    f"but the linked order record shows {actual_status}."
+                )
+                break
+    return conflicts
+
+
 def run_investigation_agent(complaint: str, transaction: TransactionOutput,
-                            fraud: FraudOutput) -> tuple[InvestigationOutput, bool]:
+                            fraud: FraudOutput,
+                            reconciliations: list[ReconciliationReport] | None = None
+                            ) -> tuple[InvestigationOutput, bool]:
     category = categorize_complaint(complaint)
     facts = list(transaction.evidence)
     hypotheses = []
+    customer_reported_conflicts = _reported_record_conflicts(
+        complaint, category, transaction, reconciliations or []
+    )
     if not transaction.found:
         facts.append("No matching transaction record was found; transaction status cannot be verified.")
         hypotheses.append("The supplied ID may contain a typo or belong to a different payment record.")
@@ -90,14 +202,14 @@ def run_investigation_agent(complaint: str, transaction: TransactionOutput,
         f"Recorded evidence and concerns: {transaction.data_conflicts}"
     )
     llm = generate(prompt)
-    if llm.text:
-        hypotheses.append(f"Unverified model interpretation: {llm.text}")
     summary = (
         f"The complaint was categorized as {category.replace('_', ' ')}. "
         + ("The available records require follow-up." if hypotheses else "No cause was confirmed from the available records.")
     )
     confidence = 0.3 if not transaction.found else 0.75
     if transaction.data_conflicts:
+        confidence = min(confidence, 0.45)
+    elif customer_reported_conflicts:
         confidence = min(confidence, 0.45)
     elif category == "duplicate_payment" and not any(
         item["status"] == "successful" for item in transaction.related_transactions
@@ -110,6 +222,7 @@ def run_investigation_agent(complaint: str, transaction: TransactionOutput,
         summary=summary,
         confirmed_facts=facts,
         hypotheses=hypotheses,
+        customer_reported_conflicts=customer_reported_conflicts,
         evidence=transaction.evidence + fraud.evidence,
         confidence=confidence,
     ), llm.used

@@ -53,8 +53,61 @@ def test_failed_payment(seeded_db):
 def test_customer_reports_debit_but_payment_failed(seeded_db):
     result = run_case("DEMO-DEBIT-FAILED-001", "My bank account was debited but payment failed.", db_path=seeded_db)
     assert result["transaction"].transaction["status"] == "failed"
-    assert any("temporary bank authorization" in item for item in result["investigation"].hypotheses)
-    assert result["resolution"].requires_human_review is False
+    assert any("bank-side debit confirmation" in item for item in result["investigation"].customer_reported_conflicts)
+    assert result["resolution"].requires_human_review
+    assert result["resolution"].recommendation == "Review customer report against payment records"
+    assert "do not verify activity in your bank account" in result["resolution"].customer_response
+
+
+def test_customer_reports_pending_but_transaction_is_successful(seeded_db):
+    result = run_case("DEMO-SUCCESS-001", "This transaction is pending.", db_path=seeded_db)
+
+    assert result["transaction"].transaction["status"] == "successful"
+    assert any("reports the payment as pending" in item
+               for item in result["investigation"].customer_reported_conflicts)
+    assert result["resolution"].requires_human_review
+    assert result["resolution"].recommendation == "Review customer report against payment records"
+    assert result["route"] == "human_review"
+
+
+def test_customer_reports_failed_but_transaction_is_successful(seeded_db):
+    result = run_case("DEMO-SUCCESS-001", "The payment failed in my app.", db_path=seeded_db)
+
+    assert any("reports the payment as failed" in item
+               for item in result["investigation"].customer_reported_conflicts)
+    assert result["resolution"].requires_human_review
+
+
+def test_customer_reports_success_but_transaction_is_failed(seeded_db):
+    result = run_case("DEMO-FAILED-001", "The payment was successful but my order is missing.", db_path=seeded_db)
+
+    assert any("reports the payment as successful" in item
+               for item in result["investigation"].customer_reported_conflicts)
+    assert result["resolution"].requires_human_review
+
+
+def test_customer_says_payment_not_successful_but_record_is_successful(seeded_db):
+    result = run_case("DEMO-SUCCESS-001", "My payment was not successful.", db_path=seeded_db)
+
+    assert any("reports the payment as failed" in item
+               for item in result["investigation"].customer_reported_conflicts)
+    assert result["resolution"].requires_human_review
+
+
+def test_reported_unsettled_payment_without_settlement_requires_review(seeded_db):
+    result = run_case("DEMO-NO-SETTLEMENT-001", "My payment settlement is pending.", db_path=seeded_db)
+
+    assert any("no settlement record is available" in item
+               for item in result["investigation"].customer_reported_conflicts)
+    assert result["resolution"].requires_human_review
+
+
+def test_settled_record_is_flagged_when_customer_reports_settlement_pending(seeded_db):
+    result = run_case("DEMO-SUCCESS-001", "My payment settlement is pending.", db_path=seeded_db)
+
+    assert any("settlement records are marked settled" in item
+               for item in result["investigation"].customer_reported_conflicts)
+    assert result["resolution"].requires_human_review
 
 
 def test_duplicate_transaction_pattern(seeded_db):
@@ -88,7 +141,8 @@ def test_refund_pending(seeded_db):
 def test_refund_completed(seeded_db):
     result = run_case("DEMO-REFUND-DONE", "I have not received my refund.", db_path=seeded_db)
     assert result["transaction"].refunds[0]["status"] == "completed"
-    assert result["resolution"].recommendation == "Share the verified refund reference"
+    assert result["resolution"].recommendation == "Review customer report against payment records"
+    assert result["resolution"].requires_human_review
 
 
 def test_missing_transaction_id(seeded_db):

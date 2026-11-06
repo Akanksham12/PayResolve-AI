@@ -18,12 +18,45 @@ st.set_page_config(page_title="PayResolve AI", page_icon="◈", layout="wide")
 st.markdown(
     """
     <style>
-    .stApp { background: #f5f7fb; }
+    :root { color-scheme: light; }
+    .stApp {
+        background: #f5f7fb;
+        color: #1e293b;
+    }
+    [data-testid="stAppViewContainer"],
+    [data-testid="stMain"],
+    [data-testid="stSidebar"] { color: #1e293b; }
     .block-container { padding-top: 1.6rem; }
     [data-testid="stMetric"] { background: white; border: 1px solid #e3e9f2;
-        padding: 16px 18px; border-radius: 12px; }
+        color: #1e293b; padding: 16px 18px; border-radius: 12px; }
+    [data-testid="stMetric"] *,
+    [data-testid="stMarkdownContainer"],
+    [data-testid="stCaptionContainer"],
+    [data-testid="stAlert"],
+    [data-testid="stExpander"],
+    [data-testid="stTab"],
+    [data-testid="stDataFrame"],
+    [data-testid="stTable"],
+    [data-testid="stCode"] { color: #1e293b; }
+    [data-testid="stMarkdownContainer"] pre,
+    [data-testid="stCode"] {
+        background-color: #e9eef5;
+        border-radius: 6px;
+    }
     .brand { color: #172554; font-weight: 800; letter-spacing: -.04em; font-size: 1.75rem; }
     .muted { color: #64748b; }
+    input, textarea, [data-baseweb="select"] > div {
+        color: #1e293b !important;
+        background-color: #ffffff !important;
+    }
+    input::placeholder, textarea::placeholder {
+        color: #64748b !important;
+        opacity: 1;
+    }
+    [role="listbox"], [role="option"], [data-baseweb="popover"] {
+        color: #1e293b;
+        background-color: #ffffff;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -81,6 +114,10 @@ def display_report(report: dict) -> None:
                 st.markdown(f"- {fact}")
         else:
             st.caption("No confirmed facts were recorded.")
+        if investigation.get("customer_reported_conflicts"):
+            st.markdown("**Customer report vs available records**")
+            for conflict in investigation["customer_reported_conflicts"]:
+                st.warning(conflict)
         if investigation["hypotheses"]:
             st.markdown("**Possible explanations (unconfirmed)**")
             for hypothesis in investigation["hypotheses"]:
