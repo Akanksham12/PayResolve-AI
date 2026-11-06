@@ -1,12 +1,16 @@
+import json
+
 import pandas as pd
 import streamlit as st
 
-from payresolve.db import resolve_human_review
+from payresolve.db import resolve_human_review, resolve_reconciliation_review
 from payresolve.logging_config import configure_logging
 from payresolve.repository import (
     fetch_admin_metrics, fetch_dispute_logs, fetch_history, fetch_pending_reviews,
+    fetch_order_samples, fetch_reconciliation_history, fetch_reconciliation_logs,
+    fetch_pending_reconciliations,
 )
-from payresolve.service import ensure_database, investigate
+from payresolve.service import ensure_database, investigate, reconcile_order
 
 configure_logging()
 st.set_page_config(page_title="PayResolve AI", page_icon="◈", layout="wide")
@@ -36,7 +40,10 @@ with st.sidebar:
     st.caption("Local payment dispute investigation")
     page = st.radio(
         "Workspace",
-        ["Customer Support", "Agent Execution", "Investigation Report", "Admin Dashboard", "Investigation History"],
+        [
+            "Customer Support", "Merchant Reconciliation", "Agent Execution",
+            "Investigation Report", "Admin Dashboard", "Investigation History",
+        ],
         label_visibility="collapsed",
     )
     st.divider()
@@ -91,7 +98,7 @@ def display_report(report: dict) -> None:
 
     with st.expander("Transaction records and evidence"):
         if transaction["found"]:
-            st.dataframe(pd.DataFrame([transaction["transaction"]]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame([transaction["transaction"]]), width="stretch", hide_index=True)
         else:
             st.info(transaction["error"] or "No transaction data.")
         tabs = st.tabs(["Payment attempts", "Refunds", "Settlements", "Related payments", "Risk evidence"])
@@ -101,13 +108,66 @@ def display_report(report: dict) -> None:
         ]
         for tab, data in zip(tabs[:4], datasets[:4]):
             with tab:
-                st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True) if data else st.caption("No records.")
+                st.dataframe(pd.DataFrame(data), width="stretch", hide_index=True) if data else st.caption("No records.")
         with tabs[4]:
             for item in fraud["evidence"]:
                 st.markdown(f"- {item}")
             st.caption(fraud["classification_note"])
         if transaction["data_conflicts"]:
             st.error("Conflicting records: " + " ".join(transaction["data_conflicts"]))
+
+
+def display_reconciliation_report(report: dict) -> None:
+    reconciliation = report["reconciliation"]
+    resolution = report["resolution"]
+    st.caption(f"Reconciliation run #{report['run_id']} · ShopKart order {report['order_id']}")
+    if reconciliation["status"] == "matched":
+        st.success("Order, gateway, settlement, and available bank-statement records match.")
+    elif reconciliation["status"] == "not_found":
+        st.error(f"No ShopKart order was found for {report['order_id']}.")
+    else:
+        st.warning(
+            f"{len(reconciliation['discrepancies'])} discrepancy/discrepancies found. "
+            "A support executive must verify source records before changing an order."
+        )
+    if report["errors"]:
+        for error in report["errors"]:
+            st.error(error)
+
+    order = reconciliation["order"]
+    if order:
+        columns = st.columns(4)
+        columns[0].metric("ShopKart order", order["status"].title())
+        columns[1].metric("Order amount", f"{order['currency']} {order['amount']:.2f}")
+        columns[2].metric("Gateway attempts", len(reconciliation["gateway_payments"]))
+        columns[3].metric("Result", reconciliation["status"].replace("_", " ").title())
+
+    st.subheader("Support recommendation")
+    st.markdown(f"**{resolution['recommendation']}**")
+    st.write(resolution["support_summary"])
+    for step in resolution["next_steps"]:
+        st.markdown(f"- {step}")
+    if resolution["requires_human_review"]:
+        st.warning(f"Human review required: {resolution['review_reason']}")
+
+    if reconciliation["discrepancies"]:
+        st.subheader("Discrepancies to verify")
+        for discrepancy in reconciliation["discrepancies"]:
+            st.markdown(f"- {discrepancy}")
+    if reconciliation["evidence"]:
+        with st.expander("Reconciliation evidence", expanded=True):
+            for item in reconciliation["evidence"]:
+                st.markdown(f"- {item}")
+            tabs = st.tabs(["ShopKart order", "Gateway attempts", "Settlement lines", "Bank statement"])
+            datasets = [
+                [order] if order else [],
+                reconciliation["gateway_payments"],
+                reconciliation["settlement_lines"],
+                reconciliation["bank_entries"],
+            ]
+            for tab, data in zip(tabs, datasets):
+                with tab:
+                    st.dataframe(pd.DataFrame(data), width="stretch", hide_index=True) if data else st.caption("No records.")
 
 
 if page == "Customer Support":
@@ -120,7 +180,7 @@ if page == "Customer Support":
             "Complaint description", height=150,
             placeholder="Describe what the customer reported, including any debit or refund concerns.",
         )
-        submit = st.form_submit_button("Investigate dispute", type="primary", use_container_width=True)
+        submit = st.form_submit_button("Investigate dispute", type="primary", width="stretch")
     st.caption(
         "Demo records: DEMO-SUCCESS-001, DEMO-FAILED-001, DEMO-DEBIT-FAILED-001, "
         "DEMO-DUPLICATE-001, DEMO-REFUND-PENDING, DEMO-REFUND-DONE, "
@@ -142,12 +202,54 @@ if page == "Customer Support":
         st.divider()
         display_report(report)
 
+elif page == "Merchant Reconciliation":
+    st.title("ShopKart Merchant Reconciliation")
+    st.write(
+        "Compare ShopKart orders with synthetic Razorpay-style payment attempts, "
+        "settlement reports, and bank-statement credits."
+    )
+    st.caption(
+        "Synthetic portfolio data only. This page does not connect to Razorpay, a bank, "
+        "or any live merchant system, and it never changes order or financial records."
+    )
+    with st.form("reconciliation_form"):
+        order_id = st.text_input("ShopKart order ID", placeholder="For example: SHOP-ORD-PAID-UNPAID")
+        submit_reconciliation = st.form_submit_button(
+            "Reconcile order", type="primary", width="stretch"
+        )
+    with st.expander("Browse sample ShopKart orders"):
+        try:
+            samples = fetch_order_samples()
+            st.dataframe(samples, width="stretch", hide_index=True)
+            st.caption("Use an order ID from this table in the reconciliation form.")
+        except Exception as exc:
+            st.error(f"Could not load sample orders: {exc}")
+    st.caption(
+        "Example discrepancy orders: SHOP-ORD-PAID-UNPAID, SHOP-ORD-AMOUNT-MISMATCH, "
+        "SHOP-ORD-PAID-GATEWAY-FAILED, SHOP-ORD-MISSING-SETTLEMENT, "
+        "SHOP-ORD-MISSING-BANK-CREDIT, SHOP-ORD-MATCHED."
+    )
+    if submit_reconciliation:
+        if not order_id.strip():
+            st.error("Enter a ShopKart order ID.")
+        else:
+            with st.spinner("Reconciling ShopKart and gateway records..."):
+                try:
+                    result = reconcile_order(order_id)
+                    st.session_state["current_reconciliation_report"] = result.model_dump()
+                except Exception as exc:
+                    st.exception(exc)
+    if st.session_state.get("current_reconciliation_report"):
+        st.divider()
+        display_reconciliation_report(st.session_state["current_reconciliation_report"])
+
 elif page == "Agent Execution":
     st.title("Agent Execution")
     report = st.session_state.get("current_report")
-    if not report:
+    reconciliation_report = st.session_state.get("current_reconciliation_report")
+    if not report and not reconciliation_report:
         st.info("Run an investigation from Customer Support to see the live agent timeline.")
-    else:
+    if report:
         st.caption(f"Transaction {report['transaction_id']} · {len(report['events'])} workflow steps")
         for event in report["events"]:
             icon = "✅" if event["status"] == "completed" else "⚠️" if event["status"] == "warning" else "❌"
@@ -161,6 +263,16 @@ elif page == "Agent Execution":
         st.progress(1.0, text="Workflow complete")
         if report["resolution"]["requires_human_review"]:
             st.warning("The supervisor routed this case to the human review queue.")
+    if reconciliation_report:
+        st.divider()
+        st.subheader(f"Order reconciliation · {reconciliation_report['order_id']}")
+        for event in reconciliation_report["events"]:
+            icon = "✅" if event["status"] == "completed" else "⚠️" if event["status"] == "warning" else "❌"
+            with st.expander(f"{icon} {event['agent']} · {event['status'].upper()}", expanded=True):
+                st.write(event["summary"])
+                st.caption(f"{event['started_at']} → {event['completed_at']}")
+                if event["tool_calls"]:
+                    st.json(event["tool_calls"])
 
 elif page == "Investigation Report":
     st.title("Investigation Report")
@@ -189,9 +301,20 @@ elif page == "Admin Dashboard":
         with right:
             st.subheader("Agent execution statistics")
             if not metrics["agents"].empty:
-                st.dataframe(metrics["agents"].round(3), use_container_width=True, hide_index=True)
+                st.dataframe(metrics["agents"].round(3), width="stretch", hide_index=True)
             else:
                 st.caption("Agent statistics will appear after investigations.")
+        st.divider()
+        st.subheader("Merchant payment reconciliation")
+        reconciliation_totals = metrics["reconciliation_totals"]
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.metric("ShopKart orders", int(reconciliation_totals["orders"]))
+        rc2.metric("Gateway payment attempts", int(reconciliation_totals["gateway_payments"]))
+        rc3.metric("Reconciliation flags", int(reconciliation_totals["flagged_runs"]))
+        rc4.metric("Reviews pending", int(reconciliation_totals["pending_reviews"]))
+        if not metrics["reconciliation_agents"].empty:
+            st.markdown("**Reconciliation agent execution statistics**")
+            st.dataframe(metrics["reconciliation_agents"].round(3), width="stretch", hide_index=True)
         st.divider()
         st.subheader("Human review queue")
         reviews = fetch_pending_reviews()
@@ -217,22 +340,64 @@ elif page == "Admin Dashboard":
                                 st.rerun()
                             except Exception as exc:
                                 st.error(f"Could not save review decision: {exc}")
+        st.divider()
+        st.subheader("Reconciliation review queue")
+        reconciliation_reviews = fetch_pending_reconciliations()
+        if not reconciliation_reviews:
+            st.caption("No order reconciliations currently await human review.")
+        for review in reconciliation_reviews:
+            with st.expander(f"Reconciliation #{review['run_id']} · {review['order_id']}"):
+                st.write(review["recommendation"])
+                for discrepancy in json.loads(review["discrepancies_json"]):
+                    st.markdown(f"- {discrepancy}")
+                with st.form(f"reconciliation_review_{review['run_id']}"):
+                    reviewer = st.text_input("Reviewer", key=f"recon_reviewer_{review['run_id']}")
+                    note = st.text_area("Decision note", key=f"recon_note_{review['run_id']}")
+                    decision = st.selectbox(
+                        "Decision", ["approved", "rejected"], key=f"recon_decision_{review['run_id']}"
+                    )
+                    if st.form_submit_button("Record reconciliation review"):
+                        if not reviewer.strip():
+                            st.error("Reviewer name is required.")
+                        else:
+                            try:
+                                resolve_reconciliation_review(
+                                    review["run_id"], decision, reviewer.strip(), note.strip()
+                                )
+                                st.success("Reconciliation review decision saved.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Could not save review decision: {exc}")
     except Exception as exc:
         st.error(f"Could not load dashboard data: {exc}")
 
 else:
     st.title("Investigation History")
     try:
-        history = fetch_history()
-        if history.empty:
-            st.info("No saved investigations yet.")
-        else:
-            st.dataframe(history, use_container_width=True, hide_index=True)
-            selected = st.selectbox("View execution details for dispute", history["dispute_id"].tolist())
-            st.markdown("**Agent timeline**")
-            for event in fetch_dispute_logs(int(selected)):
-                with st.expander(f"{event['agent']} · {event['status']}"):
-                    st.write(event["summary"])
-                    st.json(event["tool_calls"])
+        dispute_tab, reconciliation_tab = st.tabs(["Payment disputes", "Order reconciliations"])
+        with dispute_tab:
+            history = fetch_history()
+            if history.empty:
+                st.info("No saved investigations yet.")
+            else:
+                st.dataframe(history, width="stretch", hide_index=True)
+                selected = st.selectbox("View execution details for dispute", history["dispute_id"].tolist())
+                st.markdown("**Agent timeline**")
+                for event in fetch_dispute_logs(int(selected)):
+                    with st.expander(f"{event['agent']} · {event['status']}"):
+                        st.write(event["summary"])
+                        st.json(event["tool_calls"])
+        with reconciliation_tab:
+            history = fetch_reconciliation_history()
+            if history.empty:
+                st.info("No order reconciliations yet.")
+            else:
+                st.dataframe(history, width="stretch", hide_index=True)
+                selected = st.selectbox("View reconciliation execution", history["run_id"].tolist())
+                st.markdown("**Agent timeline**")
+                for event in fetch_reconciliation_logs(int(selected)):
+                    with st.expander(f"{event['agent']} · {event['status']}"):
+                        st.write(event["summary"])
+                        st.json(event["tool_calls"])
     except Exception as exc:
         st.error(f"Could not load investigation history: {exc}")

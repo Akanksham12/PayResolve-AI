@@ -1,25 +1,28 @@
 # PayResolve AI
 
-PayResolve AI is a local, synthetic-data payment dispute investigation application. It uses Streamlit for the support/admin UI, SQLite as the sole source of payment facts, deterministic Python rules for transaction and risk checks, Pydantic for validated agent results, and LangGraph to coordinate five distinct agents. Ollama with `qwen2.5:7b` is used for complaint summaries and response drafts when it is running; if unavailable, the interface and execution timeline explicitly mark the rule-based fallback.
+PayResolve AI is a local, synthetic-data **merchant payment investigation and reconciliation assistant**. It is designed for an e-commerce merchant's support and payment-operations staff (illustrated as ShopKart), not for customers to query all banks and merchants. It compares ShopKart orders with Razorpay-style gateway attempts, settlement report lines, and supplied bank-statement credits.
 
-This project does **not** connect to Razorpay, banks, payment gateways, or live payment systems. It never initiates refunds, payments, settlements, or transfers. Recommendations and customer messages are drafts; uncertain, missing, contradictory, or high-risk cases are routed to human review.
+The application uses Streamlit, SQLite, deterministic Python reconciliation rules, Pydantic output schemas, and LangGraph workflows. Ollama with `qwen2.5:7b` is available for the existing complaint-summary and response-drafting workflow. Reconciliation facts and discrepancy decisions are calculated from the database, not inferred by an LLM.
+
+This is a portfolio demonstration: **no live ShopKart, Razorpay, bank, or payment-provider systems are connected**. The Razorpay-style and bank-statement data is synthetic. The application never initiates or executes a payment, refund, transfer, settlement, or order correction. Recommendations are for a support executive; mismatches are routed to human review.
 
 ## Architecture
 
 ```text
 Streamlit UI
-  ├─ Customer Support / Execution / Report / Admin / History
-  └─ service.investigate()
-       └─ LangGraph StateGraph (shared typed state)
-            1. Transaction Agent  -> SQLite records, attempts, refunds, settlements
-            2. Fraud Detection    -> deterministic attempt/duplicate/consistency rules
-            3. Investigation      -> verified facts vs. hypotheses + Ollama complaint summary
-            4. Resolution         -> deterministic next steps + Ollama response draft
-            5. Supervisor         -> failure checks and human-review routing
-                 └─ Human Review Queue
+  ├─ Customer Support -> existing transaction-dispute workflow
+  ├─ Merchant Reconciliation -> ShopKart order ID
+  │    └─ LangGraph StateGraph (typed shared state)
+  │         1. Reconciliation Agent -> compare order, gateway, settlement, bank records
+  │         2. Support Resolution Agent -> evidence-based internal next steps
+  │         3. Reconciliation Supervisor -> route mismatches to human review
+  └─ Agent Execution / Admin / Investigation History
+
+Existing dispute workflow:
+  Transaction Agent -> Fraud Detection -> Investigation -> Resolution -> Supervisor
 ```
 
-SQLite stores customers, transactions, payment attempts, refunds, settlements, disputes, agent execution logs, and human-review decisions. Synthetic record generation is repeatable with a fixed seed and includes identifiable demo cases.
+SQLite stores customers, transactions, payment attempts, refunds, settlements, disputes, orders, gateway payments, settlement lines, bank-statement entries, execution logs, and human-review decisions. Synthetic data is repeatable with a fixed seed and includes both dispute examples and reconciliation mismatch examples.
 
 ## Requirements
 
@@ -51,11 +54,11 @@ ollama serve
 
 Keep Ollama running, then launch Streamlit in another terminal. Defaults are `http://localhost:11434` and `qwen2.5:7b`. Copy `.env.example` to `.env` and set `OLLAMA_HOST`, `OLLAMA_MODEL`, or `PAYRESOLVE_DB_PATH` to customize them.
 
-If Ollama is stopped or the model is missing, deterministic investigation and response fallbacks remain available, and the agent timeline records that inference was unavailable.
+If Ollama is stopped or the model is missing, deterministic dispute-workflow fallbacks remain available, and the agent timeline records that inference was unavailable. The reconciliation workflow is deterministic and does not depend on Ollama.
 
 ## Synthetic database
 
-The app initializes the SQLite schema and automatically seeds it if there are no transactions. To explicitly recreate the database with 750 generated records and 10 demo cases:
+The app initializes the SQLite schema and seeds it if no transactions exist. If an older transaction-only demo database is detected, it adds synthetic ShopKart orders and gateway/settlement/bank records without deleting the existing transaction data. To explicitly recreate the database with 750 transaction records and reconciliation demo cases:
 
 ```powershell
 python -m scripts.seed_db
@@ -67,7 +70,7 @@ This reseeds the configured database. To choose another database:
 python -m scripts.seed_db --db data\demo.sqlite --count 750 --seed 2026
 ```
 
-The total count must be between 500 and 1,000, including the 10 named demo transactions. Some demo transaction IDs:
+The transaction count must be between 500 and 1,000, including the existing 10 dispute demo transactions. Some transaction IDs:
 
 | ID | Scenario |
 |---|---|
@@ -83,6 +86,30 @@ The total count must be between 500 and 1,000, including the 10 named demo trans
 
 `DEMO-DUPLICATE-002` is the related second transaction for the duplicate scenario. No transaction data is invented when a lookup misses.
 
+### ShopKart order reconciliation
+
+Open **Merchant Reconciliation**, enter an order ID, and choose **Reconcile order**. The workflow compares:
+
+1. ShopKart order status and amount.
+2. Synthetic Razorpay-style payment attempts, references, statuses, amounts, and currencies.
+3. Gateway settlement gross, fee, net, and status lines.
+4. ShopKart-provided synthetic bank-statement credits grouped by settlement batch.
+
+Example order IDs:
+
+| Order ID | Demonstrated case |
+|---|---|
+| `SHOP-ORD-PAID-UNPAID` | Gateway payment succeeded but the ShopKart order is still `created`. |
+| `SHOP-ORD-AMOUNT-MISMATCH` | Gateway payment amount differs from the ShopKart order amount. |
+| `SHOP-ORD-PAID-GATEWAY-FAILED` | ShopKart order is paid but the gateway attempt failed. |
+| `SHOP-ORD-MISSING-SETTLEMENT` | Successful gateway payment has no settlement line. |
+| `SHOP-ORD-MISSING-BANK-CREDIT` | Settled gateway batch has no matching bank-statement credit. |
+| `SHOP-ORD-MATCHED` | Order, successful gateway payment, settlement, and bank credit agree. |
+
+Every reconciliation run and its agent timeline is saved locally. Mismatches and missing order records enter the reconciliation human-review queue in the Admin Dashboard. Review decisions record who reviewed the case and their note; they do not modify an order or financial record.
+
+The comparison only covers records loaded into this synthetic SQLite database. It cannot verify an actual Razorpay account or a real bank credit; a production integration would need authenticated imports/connectors and access controls.
+
 Duplicate-charge complaints are kept separate from confirmed transaction facts. If the ledger search does not find another successful same-customer, same-amount transaction within 10 minutes, the case is marked uncertain and routed for human review; the response asks for another reference and does not claim that a duplicate was confirmed.
 
 ## Tests
@@ -91,7 +118,7 @@ Duplicate-charge complaints are kept separate from confirmed transaction facts. 
 pytest -q
 ```
 
-Tests use a temporary SQLite database and stub only the optional Ollama network call; the actual graph, database lookups, deterministic agents, and review routing are exercised.
+Tests use temporary SQLite databases and stub only the optional Ollama network call in the dispute workflow. They exercise both LangGraph workflows, deterministic reconciliation rules, settlement-batch aggregation, persistence, and human-review decisions.
 
 ## Safety and review
 
@@ -100,4 +127,5 @@ Tests use a temporary SQLite database and stub only the optional Ollama network 
 - Complaints that report debits against failed transactions are not treated as verified bank debits.
 - Missing transaction records, conflicting data, low-confidence investigations, and high-risk signals require human review.
 - Admin review decisions only update the local review record. They do not execute any financial action.
+- The reconciliation demo uses seeded synthetic bank-statement records; CSV import and live provider connectors are not implemented.
 - Never enter real customer information; the included dataset and project are intended for local portfolio demonstration.
