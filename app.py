@@ -7,10 +7,10 @@ from payresolve.db import resolve_human_review, resolve_reconciliation_review
 from payresolve.logging_config import configure_logging
 from payresolve.repository import (
     fetch_admin_metrics, fetch_dispute_logs, fetch_history, fetch_pending_reviews,
-    fetch_order_samples, fetch_reconciliation_history, fetch_reconciliation_logs,
+    fetch_reconciliation_history, fetch_reconciliation_logs,
     fetch_pending_reconciliations,
 )
-from payresolve.service import ensure_database, investigate, reconcile_order
+from payresolve.service import ensure_database, investigate
 
 configure_logging()
 st.set_page_config(page_title="PayResolve AI", page_icon="◈", layout="wide")
@@ -41,8 +41,8 @@ with st.sidebar:
     page = st.radio(
         "Workspace",
         [
-            "Customer Support", "Merchant Reconciliation", "Agent Execution",
-            "Investigation Report", "Admin Dashboard", "Investigation History",
+            "Customer Support", "Agent Execution", "Investigation Report",
+            "Admin Dashboard", "Investigation History",
         ],
         label_visibility="collapsed",
     )
@@ -115,6 +115,19 @@ def display_report(report: dict) -> None:
             st.caption(fraud["classification_note"])
         if transaction["data_conflicts"]:
             st.error("Conflicting records: " + " ".join(transaction["data_conflicts"]))
+    st.divider()
+    st.subheader("Linked ShopKart / gateway reconciliation")
+    reconciliations = report.get("reconciliations", [])
+    if reconciliations:
+        for reconciliation in reconciliations:
+            display_reconciliation_report(reconciliation)
+    elif report["transaction"]["found"]:
+        st.info(
+            "No linked ShopKart order was found for this transaction in the demo ledger. "
+            "Merchant order status could not be checked."
+        )
+    else:
+        st.caption("Merchant records could not be checked because the transaction ID was not found.")
 
 
 def display_reconciliation_report(report: dict) -> None:
@@ -171,26 +184,38 @@ def display_reconciliation_report(report: dict) -> None:
 
 
 if page == "Customer Support":
-    st.title("Customer Support")
-    st.write("Submit a complaint to inspect the synthetic payment ledger and prepare a support resolution.")
+    st.title("Unified Payment Investigation")
+    st.write(
+        "Enter the payment transaction ID and complaint. PayResolve checks the linked transaction, "
+        "ShopKart order, gateway attempts, settlement lines, and bank-statement credits in one investigation."
+    )
+    st.caption(
+        "All records are synthetic local demo data. This app does not connect to a real merchant, "
+        "Razorpay, or bank."
+    )
     with st.form("investigation_form"):
         transaction_id = st.text_input("Transaction ID", placeholder="For example: DEMO-SUCCESS-001")
         claimed_amount = st.number_input("Amount reported by customer (optional)", min_value=0.0, value=0.0, step=50.0)
         complaint = st.text_area(
             "Complaint description", height=150,
-            placeholder="Describe what the customer reported, including any debit or refund concerns.",
+            placeholder="Describe the reported issue, including any debit, refund, or order-status concern.",
         )
-        submit = st.form_submit_button("Investigate dispute", type="primary", width="stretch")
+        submit = st.form_submit_button("Investigate payment", type="primary", width="stretch")
     st.caption(
         "Demo records: DEMO-SUCCESS-001, DEMO-FAILED-001, DEMO-DEBIT-FAILED-001, "
         "DEMO-DUPLICATE-001, DEMO-REFUND-PENDING, DEMO-REFUND-DONE, "
         "DEMO-SUSPICIOUS-001, DEMO-NO-SETTLEMENT-001, DEMO-CONTRADICTORY-001."
     )
+    st.caption(
+        "Reconciliation transactions: SHOP-TXN-PAID-UNPAID, SHOP-TXN-AMOUNT-MISMATCH, "
+        "SHOP-TXN-PAID-GATEWAY-FAILED, SHOP-TXN-MISSING-SETTLEMENT, "
+        "SHOP-TXN-MISSING-BANK-CREDIT, SHOP-TXN-MATCHED."
+    )
     if submit:
         if not transaction_id.strip() or len(complaint.strip()) < 5:
             st.error("Enter a transaction ID and a complaint of at least five characters.")
         else:
-            with st.spinner("Agents are investigating the complaint..."):
+            with st.spinner("Agents are checking the transaction and linked merchant records..."):
                 try:
                     report = investigate(transaction_id, complaint, claimed_amount or None)
                     st.session_state["current_report"] = report.model_dump()
@@ -202,52 +227,10 @@ if page == "Customer Support":
         st.divider()
         display_report(report)
 
-elif page == "Merchant Reconciliation":
-    st.title("ShopKart Merchant Reconciliation")
-    st.write(
-        "Compare ShopKart orders with synthetic Razorpay-style payment attempts, "
-        "settlement reports, and bank-statement credits."
-    )
-    st.caption(
-        "Synthetic portfolio data only. This page does not connect to Razorpay, a bank, "
-        "or any live merchant system, and it never changes order or financial records."
-    )
-    with st.form("reconciliation_form"):
-        order_id = st.text_input("ShopKart order ID", placeholder="For example: SHOP-ORD-PAID-UNPAID")
-        submit_reconciliation = st.form_submit_button(
-            "Reconcile order", type="primary", width="stretch"
-        )
-    with st.expander("Browse sample ShopKart orders"):
-        try:
-            samples = fetch_order_samples()
-            st.dataframe(samples, width="stretch", hide_index=True)
-            st.caption("Use an order ID from this table in the reconciliation form.")
-        except Exception as exc:
-            st.error(f"Could not load sample orders: {exc}")
-    st.caption(
-        "Example discrepancy orders: SHOP-ORD-PAID-UNPAID, SHOP-ORD-AMOUNT-MISMATCH, "
-        "SHOP-ORD-PAID-GATEWAY-FAILED, SHOP-ORD-MISSING-SETTLEMENT, "
-        "SHOP-ORD-MISSING-BANK-CREDIT, SHOP-ORD-MATCHED."
-    )
-    if submit_reconciliation:
-        if not order_id.strip():
-            st.error("Enter a ShopKart order ID.")
-        else:
-            with st.spinner("Reconciling ShopKart and gateway records..."):
-                try:
-                    result = reconcile_order(order_id)
-                    st.session_state["current_reconciliation_report"] = result.model_dump()
-                except Exception as exc:
-                    st.exception(exc)
-    if st.session_state.get("current_reconciliation_report"):
-        st.divider()
-        display_reconciliation_report(st.session_state["current_reconciliation_report"])
-
 elif page == "Agent Execution":
     st.title("Agent Execution")
     report = st.session_state.get("current_report")
-    reconciliation_report = st.session_state.get("current_reconciliation_report")
-    if not report and not reconciliation_report:
+    if not report:
         st.info("Run an investigation from Customer Support to see the live agent timeline.")
     if report:
         st.caption(f"Transaction {report['transaction_id']} · {len(report['events'])} workflow steps")
@@ -263,16 +246,6 @@ elif page == "Agent Execution":
         st.progress(1.0, text="Workflow complete")
         if report["resolution"]["requires_human_review"]:
             st.warning("The supervisor routed this case to the human review queue.")
-    if reconciliation_report:
-        st.divider()
-        st.subheader(f"Order reconciliation · {reconciliation_report['order_id']}")
-        for event in reconciliation_report["events"]:
-            icon = "✅" if event["status"] == "completed" else "⚠️" if event["status"] == "warning" else "❌"
-            with st.expander(f"{icon} {event['agent']} · {event['status'].upper()}", expanded=True):
-                st.write(event["summary"])
-                st.caption(f"{event['started_at']} → {event['completed_at']}")
-                if event["tool_calls"]:
-                    st.json(event["tool_calls"])
 
 elif page == "Investigation Report":
     st.title("Investigation Report")

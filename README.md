@@ -10,19 +10,19 @@ This is a portfolio demonstration: **no live ShopKart, Razorpay, bank, or paymen
 
 ```text
 Streamlit UI
-  ├─ Customer Support -> existing transaction-dispute workflow
-  ├─ Merchant Reconciliation -> ShopKart order ID
-  │    └─ LangGraph StateGraph (typed shared state)
-  │         1. Reconciliation Agent -> compare order, gateway, settlement, bank records
-  │         2. Support Resolution Agent -> evidence-based internal next steps
-  │         3. Reconciliation Supervisor -> route mismatches to human review
-  └─ Agent Execution / Admin / Investigation History
-
-Existing dispute workflow:
-  Transaction Agent -> Fraud Detection -> Investigation -> Resolution -> Supervisor
+  └─ Customer Support -> transaction ID + complaint
+       └─ LangGraph StateGraph (shared investigation state)
+            1. Transaction Agent -> retrieve transaction and related records
+            2. Merchant Reconciliation -> follow transaction ID to linked ShopKart order(s)
+                 -> compare order, gateway, settlement, and bank-statement records
+            3. Fraud Detection -> deterministic risk rules and evidence
+            4. Investigation -> combine complaint and verified findings
+            5. Resolution -> safe next steps and response draft
+            6. Supervisor -> route uncertain or discrepant cases to human review
+  └─ Agent Execution / Investigation Report / Admin / Investigation History
 ```
 
-SQLite stores customers, transactions, payment attempts, refunds, settlements, disputes, orders, gateway payments, settlement lines, bank-statement entries, execution logs, and human-review decisions. Synthetic data is repeatable with a fixed seed and includes both dispute examples and reconciliation mismatch examples.
+SQLite stores customers, transactions, payment attempts, refunds, settlements, disputes, orders, gateway payments, settlement lines, bank-statement entries, execution logs, and human-review decisions. The support employee enters one transaction ID and complaint; the workflow follows only explicit transaction-to-gateway-to-order links in the local database. If no linked order exists, it reports that rather than guessing. Synthetic data is repeatable with a fixed seed and includes both dispute examples and reconciliation mismatch examples.
 
 ## Requirements
 
@@ -70,7 +70,7 @@ This reseeds the configured database. To choose another database:
 python -m scripts.seed_db --db data\demo.sqlite --count 750 --seed 2026
 ```
 
-The transaction count must be between 500 and 1,000, including the existing 10 dispute demo transactions. Some transaction IDs:
+The `--count` value is the total number of transactions (500-1,000), including 10 dispute examples and the 6 ShopKart reconciliation scenarios. Some transaction IDs:
 
 | ID | Scenario |
 |---|---|
@@ -83,30 +83,23 @@ The transaction count must be between 500 and 1,000, including the existing 10 d
 | `DEMO-SUSPICIOUS-001` | Repeated failed attempts |
 | `DEMO-NO-SETTLEMENT-001` | Missing settlement record |
 | `DEMO-CONTRADICTORY-001` | Failed transaction with successful attempt record |
+| `SHOP-TXN-PAID-UNPAID` | Gateway payment succeeded but the ShopKart order is still `created` |
+| `SHOP-TXN-AMOUNT-MISMATCH` | Gateway payment amount differs from the ShopKart order amount |
+| `SHOP-TXN-PAID-GATEWAY-FAILED` | ShopKart order is paid but the gateway attempt failed |
+| `SHOP-TXN-MISSING-SETTLEMENT` | Successful gateway payment has no settlement line |
+| `SHOP-TXN-MISSING-BANK-CREDIT` | Settled gateway batch has no matching bank-statement credit |
+| `SHOP-TXN-MATCHED` | Order, successful gateway payment, settlement, and bank credit agree |
 
-`DEMO-DUPLICATE-002` is the related second transaction for the duplicate scenario. No transaction data is invented when a lookup misses.
+`DEMO-DUPLICATE-002` is the related second transaction for the duplicate scenario. Enter one of these IDs, add a complaint, and select **Investigate payment** on the Customer Support page. The report shows the transaction records plus any linked ShopKart reconciliation, the agent timeline, findings, and a resolution recommendation. For example, `SHOP-TXN-PAID-UNPAID` should show the successful gateway payment, the order's `created` status, a discrepancy, and a human-review recommendation. No transaction or order data is invented when a lookup misses.
 
-### ShopKart order reconciliation
-
-Open **Merchant Reconciliation**, enter an order ID, and choose **Reconcile order**. The workflow compares:
+For a linked order, the reconciliation compares:
 
 1. ShopKart order status and amount.
 2. Synthetic Razorpay-style payment attempts, references, statuses, amounts, and currencies.
 3. Gateway settlement gross, fee, net, and status lines.
 4. ShopKart-provided synthetic bank-statement credits grouped by settlement batch.
 
-Example order IDs:
-
-| Order ID | Demonstrated case |
-|---|---|
-| `SHOP-ORD-PAID-UNPAID` | Gateway payment succeeded but the ShopKart order is still `created`. |
-| `SHOP-ORD-AMOUNT-MISMATCH` | Gateway payment amount differs from the ShopKart order amount. |
-| `SHOP-ORD-PAID-GATEWAY-FAILED` | ShopKart order is paid but the gateway attempt failed. |
-| `SHOP-ORD-MISSING-SETTLEMENT` | Successful gateway payment has no settlement line. |
-| `SHOP-ORD-MISSING-BANK-CREDIT` | Settled gateway batch has no matching bank-statement credit. |
-| `SHOP-ORD-MATCHED` | Order, successful gateway payment, settlement, and bank credit agree. |
-
-Every reconciliation run and its agent timeline is saved locally. Mismatches and missing order records enter the reconciliation human-review queue in the Admin Dashboard. Review decisions record who reviewed the case and their note; they do not modify an order or financial record.
+Every reconciliation run and its agent timeline is saved locally with the investigation. Mismatches enter the human-review queue in the Admin Dashboard. Review decisions record who reviewed the case and their note; they do not modify an order or financial record.
 
 The comparison only covers records loaded into this synthetic SQLite database. It cannot verify an actual Razorpay account or a real bank credit; a production integration would need authenticated imports/connectors and access controls.
 
