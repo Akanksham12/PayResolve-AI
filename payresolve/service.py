@@ -1,8 +1,12 @@
 import logging
 
-from payresolve.db import initialize_database, record_dispute, log_agent_events, connection
+from payresolve.db import (
+    connection, initialize_database, record_dispute, log_agent_events,
+    record_reconciliation_run,
+)
 from payresolve.graph import investigation_graph
-from payresolve.schemas import DisputeInput, InvestigationReport
+from payresolve.reconciliation_graph import reconciliation_graph
+from payresolve.schemas import DisputeInput, InvestigationReport, ReconciliationReport, ReconciliationRequest
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +19,10 @@ def ensure_database() -> None:
         from scripts.seed_db import seed_database
 
         seed_database()
+    else:
+        from scripts.seed_db import seed_reconciliation_data
+
+        seed_reconciliation_data()
 
 
 def investigate(transaction_id: str, complaint: str, claimed_amount: float | None = None,
@@ -50,4 +58,32 @@ def investigate(transaction_id: str, complaint: str, claimed_amount: float | Non
             logger.exception("Unable to persist investigation execution logs for dispute %s", dispute_id)
             raise
         report.dispute_id = dispute_id
+    return report
+
+
+def reconcile_order(order_id: str, persist: bool = True,
+                    db_path: str | None = None) -> ReconciliationReport:
+    request = ReconciliationRequest(order_id=order_id.strip())
+    state = reconciliation_graph.invoke({
+        "order_id": request.order_id,
+        "db_path": str(db_path) if db_path is not None else None,
+        "reconciliation": None,
+        "resolution": None,
+        "events": [],
+        "errors": [],
+        "route": "complete",
+    })
+    report = ReconciliationReport(
+        order_id=request.order_id,
+        reconciliation=state["reconciliation"],
+        resolution=state["resolution"],
+        events=state["events"],
+        errors=state["errors"],
+    )
+    if persist:
+        report.run_id = record_reconciliation_run(
+            report.model_dump(),
+            [event.model_dump() for event in report.events],
+            db_path,
+        )
     return report
