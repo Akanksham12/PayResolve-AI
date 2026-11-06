@@ -9,8 +9,11 @@ from payresolve.agents.investigation import run_investigation_agent
 from payresolve.agents.resolution import run_resolution_agent
 from payresolve.agents.supervisor import select_route
 from payresolve.agents.transaction import run_transaction_agent
+from payresolve.reconciliation_graph import reconciliation_graph
+from payresolve.repository import fetch_order_ids_for_transaction
 from payresolve.schemas import (
-    AgentEvent, FraudOutput, InvestigationOutput, ResolutionOutput, TransactionOutput,
+    AgentEvent, FraudOutput, InvestigationOutput, ReconciliationOutput,
+    ReconciliationReport, ResolutionOutput, TransactionOutput,
 )
 
 logger = logging.getLogger(__name__)
@@ -20,7 +23,10 @@ class InvestigationState(TypedDict):
     transaction_id: str
     complaint: str
     claimed_amount: float | None
+    db_path: str | None
     transaction: TransactionOutput | None
+    reconciliations: list[ReconciliationReport]
+    merchant_lookup_note: str | None
     fraud: FraudOutput | None
     investigation: InvestigationOutput | None
     resolution: ResolutionOutput | None
@@ -45,7 +51,9 @@ def _append_event(state: InvestigationState, agent: str, started: str, status: s
 def transaction_node(state: InvestigationState) -> dict:
     started = _time()
     try:
-        result = run_transaction_agent(state["transaction_id"], state["claimed_amount"])
+        result = run_transaction_agent(
+            state["transaction_id"], state["claimed_amount"], state.get("db_path")
+        )
         status = "completed" if result.found else "warning"
         summary = f"Found transaction; {len(result.attempts)} attempts, {len(result.refunds)} refunds, and {len(result.settlements)} settlements." if result.found else result.error or "Transaction not found."
         calls = [{"tool": "sqlite.transaction_lookup", "input": {"transaction_id": state["transaction_id"]},
@@ -70,6 +78,91 @@ def transaction_node(state: InvestigationState) -> dict:
             "transaction": TransactionOutput(found=False, error=message),
             "errors": [*state["errors"], message],
             "events": _append_event(state, "Transaction Agent", started, "failed", message),
+        }
+
+
+def merchant_reconciliation_node(state: InvestigationState) -> dict:
+    started = _time()
+    transaction = state["transaction"]
+    db_path = state.get("db_path")
+    if not transaction or not transaction.found:
+        note = "Merchant records could not be checked because the transaction was not found."
+        return {
+            "reconciliations": [],
+            "merchant_lookup_note": note,
+            "events": _append_event(
+                state, "Merchant Reconciliation Lookup", started, "warning", note,
+                [{"tool": "sqlite.gateway_order_link_lookup", "result": "skipped_transaction_not_found"}],
+            ),
+        }
+    try:
+        order_ids = fetch_order_ids_for_transaction(state["transaction_id"], db_path)
+        if not order_ids:
+            note = (
+                "No ShopKart order is linked to this transaction ID in the available ledger; "
+                "merchant order reconciliation could not be verified."
+            )
+            return {
+                "reconciliations": [],
+                "merchant_lookup_note": note,
+                "events": _append_event(
+                    state, "Merchant Reconciliation Lookup", started, "warning", note,
+                    [{"tool": "sqlite.gateway_order_link_lookup",
+                      "input": {"transaction_id": state["transaction_id"]},
+                      "result": "no_linked_order"}],
+                ),
+            }
+
+        reports = []
+        events = []
+        errors = []
+        for order_id in order_ids:
+            result = reconciliation_graph.invoke({
+                "order_id": order_id,
+                "db_path": db_path,
+                "reconciliation": None,
+                "resolution": None,
+                "events": [],
+                "errors": [],
+                "route": "complete",
+            })
+            report = ReconciliationReport(
+                order_id=order_id,
+                reconciliation=result["reconciliation"],
+                resolution=result["resolution"],
+                events=result["events"],
+                errors=result["errors"],
+            )
+            reports.append(report)
+            events.extend(result["events"])
+            errors.extend(result["errors"])
+
+        summary = (
+            f"Reconciled {len(order_ids)} ShopKart order(s) linked to transaction {state['transaction_id']}."
+        )
+        return {
+            "reconciliations": reports,
+            "merchant_lookup_note": None,
+            "errors": [*state["errors"], *errors],
+            "events": _append_event(
+                state, "Merchant Reconciliation Lookup", started,
+                "warning" if errors else "completed", summary,
+                [{"tool": "sqlite.gateway_order_link_lookup",
+                  "input": {"transaction_id": state["transaction_id"]},
+                  "result": {"linked_orders": order_ids}}],
+            ) + events,
+        }
+    except Exception as exc:
+        logger.exception("Merchant reconciliation lookup failed for %s", state["transaction_id"])
+        message = f"Merchant reconciliation lookup failed: {exc}"
+        return {
+            "reconciliations": [],
+            "merchant_lookup_note": message,
+            "errors": [*state["errors"], message],
+            "events": _append_event(
+                state, "Merchant Reconciliation Lookup", started, "failed", message,
+                [{"tool": "sqlite.gateway_order_link_lookup", "result": "failed"}],
+            ),
         }
 
 
@@ -140,6 +233,59 @@ def resolution_node(state: InvestigationState) -> dict:
             category="other", summary="Investigation unavailable.", confidence=0.0
         )
         result = run_resolution_agent(state["complaint"], transaction, fraud, investigation)
+        reconciliation_reports = state.get("reconciliations", [])
+        reconciliation_issues = [
+            discrepancy
+            for report in reconciliation_reports
+            for discrepancy in report.reconciliation.discrepancies
+        ]
+        if len(reconciliation_reports) > 1:
+            reconciliation_issues.append(
+                f"Transaction is linked to {len(reconciliation_reports)} ShopKart orders; support must verify the intended order."
+            )
+        if state.get("merchant_lookup_note") and transaction.found:
+            reconciliation_issues.append(state["merchant_lookup_note"])
+        if reconciliation_issues:
+            reason_parts = [result.review_reason] if result.review_reason else []
+            reason_parts.extend(reconciliation_issues)
+            result = result.model_copy(update={
+                "recommendation": (
+                    result.recommendation
+                    if result.recommendation == "Reconcile missing settlement record"
+                    else "Review linked merchant payment records"
+                ),
+                "next_steps": [
+                    *result.next_steps,
+                    "Verify the ShopKart order, gateway, settlement, and bank-statement evidence in the reconciliation report.",
+                ],
+                "customer_response": (
+                    "Thanks for contacting us. We found a discrepancy between the linked merchant and payment "
+                    "records. A support specialist must verify the source records before advising on the order "
+                    "or payment. No order or financial record has been changed."
+                ),
+                "requires_human_review": True,
+                "review_reason": "; ".join(reason_parts),
+            })
+            investigation = investigation.model_copy(update={
+                "summary": investigation.summary + " Linked merchant records also require reconciliation review.",
+                "confirmed_facts": [
+                    *investigation.confirmed_facts,
+                    *[
+                        evidence
+                        for report in reconciliation_reports
+                        for evidence in report.reconciliation.evidence
+                    ],
+                    *reconciliation_issues,
+                ],
+                "evidence": [
+                    *investigation.evidence,
+                    *[
+                        evidence
+                        for report in reconciliation_reports
+                        for evidence in report.reconciliation.evidence
+                    ],
+                ],
+            })
         if not result.llm_used:
             llm_status = "unavailable"
         elif result.llm_draft_accepted:
@@ -147,6 +293,7 @@ def resolution_node(state: InvestigationState) -> dict:
         else:
             llm_status = "draft rejected by safety checks; verified-record template used"
         return {
+            "investigation": investigation,
             "resolution": result,
             "events": _append_event(
                 state, "Resolution Agent", started, "completed",
@@ -217,13 +364,15 @@ def human_review_node(state: InvestigationState) -> dict:
 def build_graph():
     workflow = StateGraph(InvestigationState)
     workflow.add_node("transaction_agent", transaction_node)
+    workflow.add_node("merchant_reconciliation", merchant_reconciliation_node)
     workflow.add_node("fraud_agent", fraud_node)
     workflow.add_node("investigation_agent", investigation_node)
     workflow.add_node("resolution_agent", resolution_node)
     workflow.add_node("supervisor_agent", supervisor_node)
     workflow.add_node("human_review", human_review_node)
     workflow.add_edge(START, "transaction_agent")
-    workflow.add_edge("transaction_agent", "fraud_agent")
+    workflow.add_edge("transaction_agent", "merchant_reconciliation")
+    workflow.add_edge("merchant_reconciliation", "fraud_agent")
     workflow.add_edge("fraud_agent", "investigation_agent")
     workflow.add_edge("investigation_agent", "resolution_agent")
     workflow.add_edge("resolution_agent", "supervisor_agent")

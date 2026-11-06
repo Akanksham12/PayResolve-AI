@@ -195,6 +195,16 @@ def fetch_reconciliation_bundle(order_id: str, db_path: str | Path | None = None
         }
 
 
+def fetch_order_ids_for_transaction(transaction_id: str, db_path: str | Path | None = None) -> list[str]:
+    with connection(db_path) as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT order_id FROM gateway_payments
+            WHERE transaction_id=? ORDER BY order_id""",
+            (transaction_id.strip(),),
+        ).fetchall()
+        return [row["order_id"] for row in rows]
+
+
 def fetch_order_samples(db_path: str | Path | None = None, limit: int = 20) -> pd.DataFrame:
     with connection(db_path) as conn:
         return pd.read_sql_query(

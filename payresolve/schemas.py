@@ -63,6 +63,7 @@ class InvestigationReport(BaseModel):
     fraud: FraudOutput
     investigation: InvestigationOutput
     resolution: ResolutionOutput
+    reconciliations: list["ReconciliationReport"] = Field(default_factory=list)
     events: list[AgentEvent] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
@@ -99,3 +100,6 @@ class ReconciliationReport(BaseModel):
     resolution: ReconciliationResolution
     events: list[AgentEvent] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+
+
+InvestigationReport.model_rebuild()
