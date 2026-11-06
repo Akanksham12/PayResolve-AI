@@ -65,3 +65,37 @@ class InvestigationReport(BaseModel):
     resolution: ResolutionOutput
     events: list[AgentEvent] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+
+
+class ReconciliationOutput(BaseModel):
+    order_id: str
+    order_found: bool
+    order: dict | None = None
+    gateway_payments: list[dict] = Field(default_factory=list)
+    settlement_lines: list[dict] = Field(default_factory=list)
+    settlement_batch_totals: list[dict] = Field(default_factory=list)
+    bank_entries: list[dict] = Field(default_factory=list)
+    status: Literal["matched", "review_required", "not_found"]
+    discrepancies: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+
+
+class ReconciliationResolution(BaseModel):
+    recommendation: str
+    next_steps: list[str] = Field(default_factory=list)
+    support_summary: str
+    requires_human_review: bool
+    review_reason: str | None = None
+
+
+class ReconciliationRequest(BaseModel):
+    order_id: str = Field(min_length=1, max_length=100)
+
+
+class ReconciliationReport(BaseModel):
+    run_id: int | None = None
+    order_id: str
+    reconciliation: ReconciliationOutput
+    resolution: ReconciliationResolution
+    events: list[AgentEvent] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)

@@ -1,5 +1,6 @@
 import argparse
 import random
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -36,6 +37,148 @@ def _insert_transaction(conn, tx_id, customer_id, amount, status, method, create
         )
 
 
+def _insert_gateway_payment(conn, order_id, gateway_payment_id, transaction_id,
+                            amount, currency, status, method, attempted_at,
+                            provider_reference, failure_reason=None):
+    conn.execute(
+        """INSERT INTO gateway_payments
+        (gateway_payment_id,order_id,transaction_id,gateway,provider_reference,
+         amount,currency,status,payment_method,attempted_at,failure_reason)
+        VALUES (?,?,?,'Razorpay (synthetic)',?,?,?,?,?,?,?)""",
+        (
+            gateway_payment_id, order_id, transaction_id, provider_reference,
+            amount, currency, status, method, attempted_at, failure_reason,
+        ),
+    )
+
+
+def _insert_settlement_line(conn, payment_id, batch_reference, amount, settled_at):
+    fee = round(amount * 0.02, 2)
+    conn.execute(
+        """INSERT INTO gateway_settlement_lines
+        (settlement_line_id,gateway_payment_id,batch_reference,gross_amount,fee_amount,
+         net_amount,status,settled_at)
+        VALUES (?,?,?,?,?,?,'settled',?)""",
+        (f"GWS-{payment_id}", payment_id, batch_reference, amount, fee, round(amount - fee, 2), settled_at),
+    )
+
+
+def _seed_reconciliation_data(conn) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    payout_totals = defaultdict(float)
+    payout_dates = {}
+    transactions = conn.execute("SELECT * FROM transactions ORDER BY transaction_id").fetchall()
+    existing_settlements = {
+        row["transaction_id"]: row
+        for row in conn.execute("SELECT * FROM settlements").fetchall()
+    }
+
+    for row in transactions:
+        tx = dict(row)
+        order_id = f"ORD-{tx['transaction_id']}"
+        order_status = {
+            "successful": "paid",
+            "failed": "failed",
+            "pending": "pending",
+        }[tx["status"]]
+        conn.execute(
+            """INSERT INTO orders
+            (order_id,customer_id,amount,currency,status,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            (
+                order_id, tx["customer_id"], tx["amount"], tx["currency"],
+                order_status, tx["created_at"], tx["created_at"],
+            ),
+        )
+        attempts = conn.execute(
+            "SELECT * FROM payment_attempts WHERE transaction_id=? ORDER BY attempt_number",
+            (tx["transaction_id"],),
+        ).fetchall()
+        for attempt in attempts:
+            payment_id = f"GWP-{tx['transaction_id']}-{attempt['attempt_number']}"
+            provider_reference = f"RZPREF-{tx['transaction_id']}-{attempt['attempt_number']}"
+            _insert_gateway_payment(
+                conn, order_id, payment_id, tx["transaction_id"], attempt["amount"],
+                tx["currency"], attempt["status"], attempt["payment_method"],
+                attempt["attempted_at"], provider_reference,
+                tx["failure_reason"] if attempt["status"] == "failed" else None,
+            )
+            if attempt["status"] == "successful" and tx["transaction_id"] in existing_settlements:
+                date_key = attempt["attempted_at"][:10]
+                batch = f"RZP-BATCH-{date_key}"
+                _insert_settlement_line(
+                    conn, payment_id, batch, attempt["amount"],
+                    existing_settlements[tx["transaction_id"]]["settled_at"],
+                )
+                payout_totals[batch] += round(attempt["amount"] - round(attempt["amount"] * 0.02, 2), 2)
+                payout_dates[batch] = existing_settlements[tx["transaction_id"]]["settled_at"] or attempt["attempted_at"]
+
+    customer_id = "CUST-DEMO-01"
+    conn.execute(
+        "INSERT OR IGNORE INTO customers (customer_id,name,email,created_at) VALUES (?,?,?,?)",
+        (customer_id, "Alex Sample", "cust-demo-01@example.test", now.isoformat()),
+    )
+    demo_time = (now - timedelta(minutes=30)).isoformat(timespec="seconds")
+    demo_orders = [
+        ("SHOP-ORD-PAID-UNPAID", 50000.00, "created", 50000.00, "successful", True, True),
+        ("SHOP-ORD-AMOUNT-MISMATCH", 50000.00, "paid", 49900.00, "successful", True, True),
+        ("SHOP-ORD-PAID-GATEWAY-FAILED", 1200.00, "paid", 1200.00, "failed", False, False),
+        ("SHOP-ORD-MISSING-SETTLEMENT", 799.00, "paid", 799.00, "successful", False, False),
+        ("SHOP-ORD-MISSING-BANK-CREDIT", 899.00, "paid", 899.00, "successful", True, False),
+        ("SHOP-ORD-MATCHED", 2500.00, "paid", 2500.00, "successful", True, True),
+    ]
+    for order_id, order_amount, order_status, payment_amount, payment_status, settled, bank_credited in demo_orders:
+        conn.execute(
+            """INSERT INTO orders
+            (order_id,customer_id,amount,currency,status,created_at,updated_at)
+            VALUES (?,?,?,'INR',?,?,?)""",
+            (order_id, customer_id, order_amount, order_status, demo_time, demo_time),
+        )
+        payment_id = f"GWP-{order_id}"
+        batch = f"RZP-BATCH-{order_id}"
+        _insert_gateway_payment(
+            conn, order_id, payment_id, None, payment_amount, "INR",
+            payment_status, "UPI", demo_time, f"RZPREF-{order_id}",
+            "Issuer declined" if payment_status == "failed" else None,
+        )
+        if settled:
+            _insert_settlement_line(conn, payment_id, batch, payment_amount, demo_time)
+            net = round(payment_amount - round(payment_amount * 0.02, 2), 2)
+            payout_totals[batch] = net
+            payout_dates[batch] = demo_time
+        if bank_credited:
+            amount = payout_totals.get(batch)
+            if amount is not None:
+                conn.execute(
+                    """INSERT INTO bank_statement_entries
+                    (bank_entry_id,batch_reference,amount,currency,credited_at,bank_reference)
+                    VALUES (?,?,?,?,?,?)""",
+                    (f"BANK-{order_id}", batch, amount, "INR", demo_time, f"BNKREF-{order_id}"),
+                )
+
+    for batch, amount in payout_totals.items():
+        if batch.startswith("RZP-BATCH-SHOP-ORD-"):
+            continue
+        conn.execute(
+            """INSERT INTO bank_statement_entries
+            (bank_entry_id,batch_reference,amount,currency,credited_at,bank_reference)
+            VALUES (?,?,?,?,?,?)""",
+            (f"BANK-{batch}", batch, round(amount, 2), "INR", payout_dates[batch], f"BNKREF-{batch}"),
+        )
+
+
+def seed_reconciliation_data(db_path: str | Path | None = None) -> int:
+    """Backfill synthetic ShopKart/gateway records for an existing transaction-only database."""
+    with connection(db_path) as conn:
+        if conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]:
+            return 0
+        transaction_count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+        if not transaction_count:
+            return 0
+        _seed_reconciliation_data(conn)
+        return transaction_count
+
+
 def seed_database(db_path: str | Path | None = None, transaction_count: int = 750, seed: int = 2026) -> int:
     if not 500 <= transaction_count <= 1000:
         raise ValueError("transaction_count must be between 500 and 1000")
@@ -46,6 +189,12 @@ def seed_database(db_path: str | Path | None = None, transaction_count: int = 75
     statuses = ["successful", "successful", "successful", "failed", "pending"]
     methods = ["UPI", "card", "netbanking", "wallet"]
     with connection(db_path) as conn:
+        conn.execute("DELETE FROM reconciliation_logs")
+        conn.execute("DELETE FROM reconciliation_runs")
+        conn.execute("DELETE FROM bank_statement_entries")
+        conn.execute("DELETE FROM gateway_settlement_lines")
+        conn.execute("DELETE FROM gateway_payments")
+        conn.execute("DELETE FROM orders")
         conn.execute("DELETE FROM human_reviews")
         conn.execute("DELETE FROM investigation_logs")
         conn.execute("DELETE FROM disputes")
@@ -107,6 +256,7 @@ def seed_database(db_path: str | Path | None = None, transaction_count: int = 75
         ]
         for row in demo:
             _insert_transaction(conn, *row)
+        _seed_reconciliation_data(conn)
     return transaction_count
 
 
