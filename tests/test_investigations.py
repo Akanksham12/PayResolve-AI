@@ -60,6 +60,21 @@ def test_duplicate_transaction_pattern(seeded_db):
     assert result["transaction"].related_transactions
     assert result["fraud"].risk_level in {"medium", "high"}
     assert result["resolution"].recommendation == "Review possible duplicate payment"
+    assert result["resolution"].requires_human_review
+
+
+def test_unverified_duplicate_complaint_with_typo_requires_review(seeded_db):
+    result = run_case("DEMO-SUCCESS-001", "i was charged twicw")
+    assert result["investigation"].category == "duplicate_payment"
+    assert not result["transaction"].related_transactions
+    assert result["fraud"].risk_level == "low"
+    assert result["investigation"].confidence < 0.6
+    assert any("second successful transaction was not found" in item for item in result["investigation"].hypotheses)
+    assert result["resolution"].recommendation == "Verify the unconfirmed duplicate-charge report"
+    assert result["resolution"].requires_human_review
+    assert result["route"] == "human_review"
+    assert "could not verify a second" in result["resolution"].customer_response
+    assert "confirmed a duplicate charge" in result["resolution"].customer_response
 
 
 def test_refund_pending(seeded_db):

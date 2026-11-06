@@ -83,6 +83,8 @@ The total count must be between 500 and 1,000, including the 10 named demo trans
 
 `DEMO-DUPLICATE-002` is the related second transaction for the duplicate scenario. No transaction data is invented when a lookup misses.
 
+Duplicate-charge complaints are kept separate from confirmed transaction facts. If the ledger search does not find another successful same-customer, same-amount transaction within 10 minutes, the case is marked uncertain and routed for human review; the response asks for another reference and does not claim that a duplicate was confirmed.
+
 ## Tests
 
 ```powershell

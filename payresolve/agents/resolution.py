@@ -23,6 +23,7 @@ def run_resolution_agent(complaint: str, transaction: TransactionOutput, fraud: 
     must_review = (
         not transaction.found or fraud.risk_level == "high"
         or investigation.confidence < 0.6 or bool(transaction.data_conflicts)
+        or investigation.category == "duplicate_payment"
     )
     review_reasons = []
     if not transaction.found:
@@ -33,10 +34,29 @@ def run_resolution_agent(complaint: str, transaction: TransactionOutput, fraud: 
         review_reasons.append("investigation confidence is low")
     if transaction.data_conflicts:
         review_reasons.append("transaction records contain contradictions")
+    if investigation.category == "duplicate_payment":
+        review_reasons.append("customer reports a duplicate charge that needs transaction-reference verification")
 
     if not transaction.found:
         recommendation = "Request transaction verification"
         next_steps = ["Ask the customer to confirm the transaction ID and share a redacted payment reference."]
+    elif investigation.category == "duplicate_payment":
+        successful_related = [
+            item for item in transaction.related_transactions
+            if item["status"] == "successful"
+        ]
+        if successful_related:
+            recommendation = "Review possible duplicate payment"
+            next_steps = [
+                "Compare the recorded transaction references and confirm which charge the customer disputes."
+            ]
+        else:
+            recommendation = "Verify the unconfirmed duplicate-charge report"
+            next_steps = [
+                "Explain that this ledger search did not find a second matching successful payment.",
+                "Ask the customer for the other transaction reference or a redacted bank record.",
+                "Have a support specialist verify the reported second charge; do not state that a duplicate was confirmed.",
+            ]
     else:
         tx = transaction.transaction
         refunds = transaction.refunds
@@ -84,6 +104,16 @@ def run_resolution_agent(complaint: str, transaction: TransactionOutput, fraud: 
         customer_response = (
             "Thanks for contacting us. We could not locate a payment with the transaction ID provided, "
             "so we cannot verify its status yet. Please confirm the ID and share a redacted payment reference."
+        )
+    elif investigation.category == "duplicate_payment" and not any(
+        item["status"] == "successful" for item in transaction.related_transactions
+    ):
+        tx = transaction.transaction
+        customer_response = (
+            f"Thanks for letting us know. Our records show transaction {tx['transaction_id']} as "
+            f"{tx['status']} for {tx['currency']} {tx['amount']:.2f}, but we could not verify a second "
+            "matching successful payment in the ledger. Please share the other transaction reference or "
+            "a redacted bank record so a support specialist can review it. We have not confirmed a duplicate charge."
         )
     else:
         tx = transaction.transaction
